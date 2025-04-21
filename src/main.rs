@@ -1,21 +1,20 @@
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use color_eyre::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::{
+    DefaultTerminal,
     prelude::*,
     style::{Color, Style},
     widgets::*,
 };
 use regex::Regex;
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, HeaderMap, HeaderValue, USER_AGENT};
-use std::io::{self};
 
 struct App {
     isbn: String,
     input_mode: InputMode,
+    flash: Option<String>,
     error: Option<String>,
+    should_exit: bool,
 
     book_list: BookList,
 }
@@ -44,8 +43,10 @@ impl Default for App {
     fn default() -> Self {
         Self {
             isbn: String::new(),
+            flash: None,
             input_mode: InputMode::Normal,
             book_list: BookList::default(),
+            should_exit: false,
             error: None,
         }
     }
@@ -151,157 +152,198 @@ async fn fetch_book_info(
     // Extract thumbnails
     let thumbnails: Vec<_> = thumbnail_regex
         .captures_iter(&converted_body)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .filter_map(|cap| {
+            cap.get(1)
+                .map(|m| format!("https://www.babelio.com{}", m.as_str()))
+        })
         .collect();
 
     Ok((titles, authors, urls, thumbnails))
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
-    loop {
-        // Render the UI
-        terminal.draw(|f| ui(f, &app))?;
-
-        // Handle input events
-        if let Event::Key(key) = event::read()? {
-            match app.input_mode {
-                InputMode::Normal => match key.code {
-                    KeyCode::Char('e') => {
-                        app.input_mode = InputMode::Editing;
-                    }
-                    KeyCode::Char('v') => {
-                        app.input_mode = InputMode::Viewing;
-                        app.book_list.state.select(Some(0));
-                    }
-                    KeyCode::Char('q') => return Ok(()),
-                    _ => {}
-                },
-                InputMode::Editing => match key.code {
-                    KeyCode::Enter => {
-                        // Perform search
-                        let isbn = app.isbn.clone();
-                        let rt = tokio::runtime::Runtime::new().unwrap();
-                        match rt.block_on(fetch_book_info(&isbn)) {
-                            Ok((titles, authors, urls, thumbnails)) => {
-                                app.book_list.items.clear();
-                                app.book_list.items.extend(
-                                    titles
-                                        .iter()
-                                        .zip(authors.iter())
-                                        .zip(urls.iter())
-                                        .zip(thumbnails.iter())
-                                        .map(|(((title, author), url), thumbnail)| {
-                                            Book::new(title, author, url, thumbnail)
-                                        }),
-                                );
-                                app.error = None;
-                                app.input_mode = InputMode::Viewing;
-                                app.book_list.state.select(Some(0));
-                            }
-                            Err(e) => {
-                                app.error = Some(e.to_string());
-                            }
+impl App {
+    fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        while !self.should_exit {
+            terminal.draw(|frame| frame.render_widget(&mut self, frame.area()))?;
+            if let Event::Key(key) = event::read()? {
+                self.handle_key(key);
+            }
+        }
+        Ok(())
+    }
+    fn handle_key(&mut self, key: KeyEvent) {
+        match self.input_mode {
+            InputMode::Normal => match key.code {
+                KeyCode::Char('e') => {
+                    self.input_mode = InputMode::Editing;
+                }
+                KeyCode::Char('v') => {
+                    self.input_mode = InputMode::Viewing;
+                    self.book_list.state.select(Some(0));
+                }
+                KeyCode::Char('q') => {
+                    self.should_exit = true;
+                }
+                _ => {}
+            },
+            InputMode::Editing => match key.code {
+                KeyCode::Enter => {
+                    // Perform search
+                    let isbn = self.isbn.clone();
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    match rt.block_on(fetch_book_info(&isbn)) {
+                        Ok((titles, authors, urls, thumbnails)) => {
+                            self.book_list.items.clear();
+                            self.book_list.items.extend(
+                                titles
+                                    .iter()
+                                    .zip(authors.iter())
+                                    .zip(urls.iter())
+                                    .zip(thumbnails.iter())
+                                    .map(|(((title, author), url), thumbnail)| {
+                                        Book::new(title, author, url, thumbnail)
+                                    }),
+                            );
+                            self.error = None;
+                            self.input_mode = InputMode::Viewing;
+                            self.book_list.state.select(Some(0));
+                        }
+                        Err(e) => {
+                            self.error = Some(e.to_string());
                         }
                     }
-                    KeyCode::Char(c) => {
-                        app.isbn.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        app.isbn.pop();
-                    }
-                    KeyCode::Esc => {
-                        app.input_mode = InputMode::Normal;
-                    }
-                    _ => {}
-                },
-                InputMode::Viewing => match key.code {
-                    KeyCode::Down => {}
-                    KeyCode::Up => {}
-                    KeyCode::Right => {}
-                    KeyCode::Char('q') => {
-                        app.input_mode = InputMode::Normal;
-                    }
-                    _ => {}
-                },
-            }
+                }
+                KeyCode::Char(c) => {
+                    self.isbn.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.isbn.pop();
+                }
+                KeyCode::Esc => {
+                    self.input_mode = InputMode::Normal;
+                }
+                _ => {}
+            },
+            InputMode::Viewing => match key.code {
+                KeyCode::Down => {
+                    self.book_list.state.select_next();
+                }
+                KeyCode::Up => {
+                    self.book_list.state.select_previous();
+                }
+                KeyCode::Enter => {
+                    cli_clipboard::set_contents(self.markdown_text().to_owned()).unwrap();
+                    self.flash = Some(String::from("Saved to clipboard!"));
+                }
+
+                KeyCode::Char('q') => {
+                    self.input_mode = InputMode::Normal;
+                }
+                _ => {}
+            },
+        }
+    }
+    fn render_results(&mut self, area: Rect, buf: &mut Buffer) {
+        let items: Vec<_> = self
+            .book_list
+            .items
+            .iter()
+            .map(|book| {
+                let title = format!("{} by {}", book.title, book.author);
+                ListItem::new(title)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("Results"))
+            .highlight_style(Style::default().bg(Color::Yellow))
+            .highlight_symbol(">> ");
+
+        StatefulWidget::render(list, area, buf, &mut self.book_list.state);
+    }
+    fn markdown_text(&mut self) -> String {
+        if let Some(ix) = self.book_list.state.selected() {
+            let book: &Book = &self.book_list.items[ix];
+            format!(
+                "{0} par {1}\n- Sur [Babelio]({2})\nThumb: {3}",
+                book.title, book.author, book.url, book.thumbnail
+            )
+        } else {
+            format!("Search something!")
         }
     }
 }
 
-fn render_results(book_list: &BookList, area: Rect, f: &mut Frame) {
-    let items: Vec<_> = book_list
-        .items
-        .iter()
-        .map(|book| {
-            let title = format!("{} by {}", book.title, book.author);
-            ListItem::new(title)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Results"))
-        .highlight_style(Style::default().bg(Color::Yellow))
-        .highlight_symbol(">> ");
-
-    f.render_stateful_widget(list, area, &mut book_list.state.clone());
-}
-
-fn ui(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+impl Widget for &mut App {
+    fn render(self, area: Rect, buf: &mut Buffer)
+    where
+        Self: Sized,
+    {
+        let [search, list, render, footer] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(10),
+            Constraint::Fill(1),
             Constraint::Length(3),
         ])
-        .split(f.size());
+        .areas(area);
 
-    // Input area
-    let input = Paragraph::new(app.isbn.clone())
-        .style(match app.input_mode {
-            InputMode::Normal | InputMode::Viewing => Style::default(),
-            InputMode::Editing => Style::default().fg(Color::Yellow),
-        })
-        .block(Block::default().borders(Borders::ALL).title("ISBN"));
-    f.render_widget(input, chunks[0]);
+        // Input area
+        let input = Paragraph::new(self.isbn.clone())
+            .style(match self.input_mode {
+                InputMode::Normal | InputMode::Viewing => Style::default(),
+                InputMode::Editing => Style::default().fg(Color::Yellow),
+            })
+            .block(Block::default().borders(Borders::ALL).title("query"));
+        Widget::render(input, search, buf);
 
-    render_results(&app.book_list, chunks[1], f);
+        self.render_results(list, buf);
 
-    // Help/Instructions
-    let help_text = match app.input_mode {
-        InputMode::Normal => "Press 'e' to edit ISBN, 'v' to navigate results, 'q' to quit",
-        InputMode::Editing => "Enter ISBN, press Enter to search, Esc to cancel",
-        InputMode::Viewing => "Select a result with Up/Down, press 'q' to go back",
-    };
-    let help = Paragraph::new(help_text)
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::Cyan));
-    f.render_widget(help, chunks[2]);
+        let results = Paragraph::new(self.markdown_text())
+            .style(match self.input_mode {
+                InputMode::Normal | InputMode::Editing => Style::default(),
+                InputMode::Viewing => Style::default().fg(Color::Yellow),
+            })
+            .block(Block::default().borders(Borders::ALL).title("Markdown"));
+        Widget::render(results, render, buf);
 
-    // Place cursor
-    if app.input_mode == InputMode::Editing {
-        f.set_cursor(chunks[0].x + app.isbn.len() as u16 + 1, chunks[0].y + 1)
+        // Help/Instructions
+        let help_text = match self.input_mode {
+            InputMode::Normal => "Press 'e' to edit query, 'v' to navigate results, 'q' to quit",
+            InputMode::Editing => "Enter query, press Enter to search, Esc to cancel",
+            InputMode::Viewing => {
+                "Select a result with Up/Down, press Enter to copy to clipboard press 'q' to go back"
+            }
+        };
+
+        let final_text = match &self.flash {
+            Some(f) => format!("{} || {}", f, help_text),
+            _ => help_text.into(),
+        };
+
+        if self.flash.is_some() {
+            self.flash = None;
+        }
+
+        let help = Paragraph::new(final_text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Cyan));
+        Widget::render(help, footer, buf);
+
+        // Place cursor
+        //if sefl.input_mode == InputMode::Editing {
+        //    SetCursorStyle
+        //    set_cursor_position(Position::new(
+        //        chunks[0].x + app.isbn.len() as u16 + 1,
+        //        chunks[0].y + 1,
+        //    ))
+        //}
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Run the app
-    let app = App::default();
-    let result = run_app(&mut terminal, app);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result?;
-
-    Ok(())
+fn main() -> Result<()> {
+    color_eyre::install()?;
+    let terminal = ratatui::init();
+    let app_result = App::default().run(terminal);
+    ratatui::restore();
+    app_result
 }
